@@ -1,0 +1,123 @@
+# Hospital Patient Monitoring System — local development stack
+#   docker compose up -d --build            # postgres, kafka, backend (http://localhost:5000), spark-streaming
+#   docker compose run --rm producer --speed 20          # replay the dataset into Kafka
+#   docker compose run --rm spark-analytics              # Spark batch analytics snapshot
+# Copy .env.example to .env and set real passwords first.
+name: hpms
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-hpms}
+      POSTGRES_USER: ${POSTGRES_USER:-hpms}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      TZ: Asia/Dili
+      PGTZ: Asia/Dili
+    ports: ["${POSTGRES_PORT:-5432}:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./database/seed.sql:/docker-entrypoint-initdb.d/02_seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hpms} -d ${POSTGRES_DB:-hpms}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:3.9.0
+    restart: unless-stopped
+    ports: ["29092:29092"]            # host access: localhost:29092
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    volumes: [kafkadata:/var/lib/kafka/data]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  kafka-init:                           # creates the topic once, then exits
+    image: apache/kafka:3.9.0
+    depends_on:
+      kafka: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists
+      --topic ${KAFKA_TOPIC:-patient-vital-events} --partitions 3 --replication-factor 1 &&
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic ${KAFKA_TOPIC:-patient-vital-events}"
+    restart: "no"
+
+  backend:
+    build: {context: ., dockerfile: backend/Dockerfile}
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-hpms}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-hpms}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    ports: ["${APP_PORT:-5000}:5000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  spark-streaming:
+    build: {context: ., dockerfile: bigdata/Dockerfile}
+    restart: unless-stopped
+    depends_on:
+      backend: {condition: service_healthy}       # schema + users exist
+      kafka-init: {condition: service_completed_successfully}
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-hpms}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-hpms}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPARK_CHECKPOINT_DIR: /checkpoints/stream
+    command: ["python", "/app/bigdata/spark/stream_processor.py", "--source", "kafka", "--trigger", "2"]
+    volumes:
+      - sparkcheckpoints:/checkpoints
+      - ./bigdata/logs:/app/bigdata/logs
+    ports: ["4040:4040"]                           # Spark UI
+
+  producer:                                        # run on demand: docker compose run --rm producer --speed 20
+    build: {context: ., dockerfile: bigdata/Dockerfile}
+    profiles: ["tools"]
+    depends_on:
+      kafka-init: {condition: service_completed_successfully}
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-patient-vital-events}
+    entrypoint: ["python", "/app/bigdata/producer/producer.py", "--state-file", "/state/producer_state.json"]
+    volumes: [producerstate:/state]
+
+  spark-analytics:                                 # run on demand: docker compose run --rm spark-analytics
+    build: {context: ., dockerfile: bigdata/Dockerfile}
+    profiles: ["tools"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-hpms}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-hpms}
+    command: ["python", "/app/bigdata/spark/spark_batch_analytics.py"]
+
+volumes:
+  pgdata:
+  kafkadata:
+  sparkcheckpoints:
+  producerstate:

@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+bigdata/checkpoints/
+bigdata/stream_input/
+bigdata/logs/*.log
+bigdata/producer/.producer_state.json
+dataset/logs/
+dataset/expanded/
+tests/results/*.tmp
+spark-warehouse/
+metastore_db/
+derby.log
+.DS_Store
